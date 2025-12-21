@@ -12,26 +12,23 @@ strona = st.sidebar.radio("Idź do:", ["Tabela danych", "Statystyki", "Dodaj rę
 
 
 conn = sqlite3.connect('baza1.db')
-c = conn.cursor()
-
-# --- 🛠️ WYMUSZENIE POPRAWNEJ STRUKTURY BAZY ---
-# To sprawi, że ID będzie się samo dodawać (1, 2, 3...)
-c.execute('''
-    CREATE TABLE IF NOT EXISTS dane (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        data TEXT,
-        kategoria TEXT,
-        opis TEXT,
-        kwota REAL
-    )
-''')
+cursor = conn.cursor()
+cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dane (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data TEXT,
+                opis TEXT,
+                kategoria TEXT,
+                kwota REAL
+            )
+            """)
 conn.commit()
 
 # --- 1. FUNKCJA PRZETWARZAJĄCA CSV (Twoja logika) ---
 def przetworz_csv(uploaded_file):
     try:
         # PODEJŚCIE 1 (prawdopodobnie mBank)
-        dane = pd.read_csv(uploaded_file, delimiter=';', index_col=False, skiprows=25)
+        dane = pd.read_csv(uploaded_file, delimiter=';', index_col=False, skiprows=25, encoding='utf-8')
         dane.columns = dane.columns.str.replace("#", "")
         
         # Dostosowanie nazw kolumn do Twojej bazy
@@ -99,23 +96,46 @@ with st.expander("📥 Wgraj wyciąg z banku (CSV)"):
     
     if uploaded_file is not None:
         try:
-            # Używamy naszej funkcji
+            # 1. Przetwarzamy
             df_new = przetworz_csv(uploaded_file)
             
             st.write("Podgląd danych do wgrania:")
             st.dataframe(df_new.head(3))
-            st.info(f"Znaleziono {len(df_new)} transakcji.")
             
             if st.button("🔥 Dodaj te transakcje do bazy"):
-                # Zapisujemy do bazy
-                # index=False, bo baza sama nada nowe ID
-                df_new.to_sql('dane', conn, if_exists='append', index=False)
+                # --- OBLICZANIE NOWYCH ID ---
+                cursor = conn.cursor()
+                try:
+                    result = cursor.execute("SELECT MAX(id) FROM dane").fetchone()
+                    # TU BYŁ BŁĄD. Dodajemy int(), żeby wymusić liczbę całkowitą
+                    if result[0] is not None:
+                        max_id = int(result[0])
+                    else:
+                        max_id = 0
+                except:
+                    max_id = 0
                 
-                st.success("Sukces! Dane zostały dodane.")
-                st.rerun() # Odświeżamy stronę, żeby zobaczyć je w tabeli na dole
+                # Teraz max_id jest na pewno intem, więc range zadziała
+                nowe_id = range(max_id + 1, max_id + 1 + len(df_new))
+                df_new['id'] = list(nowe_id) # Zamieniamy range na listę dla pewności
+                # ----------------------------
+
+                # Mapujemy nazwy kolumn na małe litery dla SQL
+                df_to_save = df_new.rename(columns={
+                    'Data': 'data',
+                    'Kategoria': 'kategoria',
+                    'Opis': 'opis',
+                    'Kwota': 'kwota'
+                })
+                
+                # Zapisujemy
+                df_to_save.to_sql('dane', conn, if_exists='append', index=False)
+                
+                st.success(f"Dodano {len(df_new)} wierszy! (ID od {max_id + 1})")
+                st.rerun()
                 
         except Exception as e:
-            st.error(f"Nie udało się przetworzyć pliku. Sprawdź format. Błąd: {e}")
+            st.error(f"Błąd przetwarzania: {e}")
 
 if strona == "Tabela danych":
     st.subheader("📝 Edycja i Przegląd Wydatków")
