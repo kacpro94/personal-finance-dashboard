@@ -3,6 +3,8 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 import datetime
+import traceback
+import altair as alt
 
 st.set_page_config(page_title="Budżet (Google Sheets)", layout="wide")
 
@@ -189,7 +191,7 @@ def przetworz_csv(uploaded_file):
 # ==========================================
 
 st.sidebar.title("Nawigacja")
-strona = st.sidebar.radio("Idź do:", ["Tabela danych", "Statystyki", "Dodaj ręcznie"])
+strona = st.sidebar.radio("Idź do:", ["Tabela danych", "Wydatki w czasie", "Wydatki według kategorii"])
 
 df_full = pobierz_dane()
 
@@ -246,7 +248,7 @@ if strona == "Tabela danych":
     col_f1, col_f2, col_f3 = st.columns([2, 2, 1])
 
     with col_f1:
-        filtry_kat = st.multiselect("Kategorie", LISTA_KATEGORII, default=LISTA_KATEGORII)
+        filtry_kat = st.multiselect("Kategorie", LISTA_KATEGORII)
 
     with col_f2:
         date_range = st.date_input("Zakres dat", key="wybrane_daty")
@@ -256,10 +258,8 @@ if strona == "Tabela danych":
         st.write("")
         st.button("📅 Ten miesiąc", on_click=ustaw_obecny_miesiac)
 
-    # --- APLIKOWANIE FILTRÓW ---
     df_view = df_full.copy()
 
-    # Filtr daty
     if isinstance(date_range, tuple):
         if len(date_range) == 2:
             start_date, end_date = date_range
@@ -270,20 +270,18 @@ if strona == "Tabela danych":
             maska_daty = (df_view['data'].dt.date == start_date)
             df_view = df_view[maska_daty]
 
-    # Filtr kategorii
     if filtry_kat:
         df_view = df_view[df_view['kategoria'].isin(filtry_kat)]
 
     df_view = df_view.sort_values(by='data', ascending=False)
 
-    # --- PODSUMOWANIE ---
     st.markdown("---")
     suma_widoczna = pd.to_numeric(
         df_view.loc[~df_view['kategoria'].isin(["Bez kategorii", "Regularne oszczędzanie",'Nieistotne']), 'kwota'],
         errors='coerce'
     ).fillna(0).sum()
-    liczba_transakcji = len(df_view)
-
+    Wpływy = df_view.loc[df_view['kategoria'].isin(["Wpływy", "Wynagrodzenie", "Wpływy - inne"]), 'kwota'].sum()
+    Wydatki = -df_view.loc[~df_view['kategoria'].isin(["Wpływy", "Wynagrodzenie", "Wpływy - inne","Bez kategorii", "Regularne oszczędzanie",'Nieistotne']), 'kwota'].sum()
     c1, c2, c3 = st.columns(3)
     with c1:
         if suma_widoczna >= 0:
@@ -291,20 +289,18 @@ if strona == "Tabela danych":
         else:
             st.metric("💸 Suma wydatków", f"{suma_widoczna:.2f} PLN")
     with c2:
-        st.metric("🧾 Liczba transakcji", f"{liczba_transakcji}")
+        st.metric("🧾 Wpływy", f"{Wpływy:.2f} PLN")
     with c3:
-        srednia = suma_widoczna / liczba_transakcji if liczba_transakcji > 0 else 0
-        st.metric("📉 Średni wydatek", f"{srednia:.2f} PLN")
+        st.metric("📊 Wydatki", f"{Wydatki:.2f} PLN")
     st.markdown("---")
 
-    # --- EDYTOR TABELI STREAMLIT ---
-    # Dodajemy hide_index=True, żeby usunąć tę dziwną pierwszą kolumnę
+
     df_edited_result = st.data_editor(
         df_view,
         column_order=["data", "kategoria", "opis", "kwota"],
         num_rows="dynamic",
         use_container_width=True,
-        hide_index=True,  # <--- TO USUWA "DZIWNĄ KOLUMNĘ"
+        hide_index=True,  
         key="editor_glowny",
         column_config={
             "kwota": st.column_config.NumberColumn("Kwota (PLN)", format="%.2f", step=0.01),
@@ -313,23 +309,12 @@ if strona == "Tabela danych":
         }
     )
 
-    # --- ZAPIS EDYCJI DO GOOGLE SHEETS (POPRAWIONY - OBSŁUGUJE USUWANIE) ---
     if st.button("💾 Zapisz zmiany w chmurze"):
         try:
-            # A. LOGIKA USUWANIA
-            # Musimy sprawdzić, co zniknęło z widoku (df_view), a nie z całej bazy.
-            
-            # 1. ID, które były widoczne PRZED edycją (wczytane do edytora)
             ids_przed_edycja = set(df_view['id'].tolist())
             
-            # 2. ID, które zostały PO edycji (to co oddał edytor)
             ids_po_edycji = set(df_edited_result['id'].dropna().tolist()) # dropna bo nowe wiersze nie mają ID
-            
-            # 3. Różnica = to co Użytkownik usunął klawiszem Delete
             ids_usuniete = ids_przed_edycja - ids_po_edycji
-            
-            # 4. Usuwamy te ID z głównej bazy (df_full)
-            # Zostawiamy wiersze, których ID NIE JEST w zbiorze usuniętych
             df_po_usunieciu = df_full[~df_full['id'].isin(ids_usuniete)]
             
             # B. LOGIKA AKTUALIZACJI I DODAWANIA
@@ -338,13 +323,9 @@ if strona == "Tabela danych":
             
             # 1. Oddzielamy wiersze, które edytor nam zwrócił
             df_to_update = df_edited_result.copy()
-            
-            # 2. Usuwamy z bazy (df_po_usunieciu) stare wersje wierszy, które teraz nadpiszemy
-            # (czyli te, które są w df_to_update i mają ID)
             ids_do_aktualizacji = df_to_update['id'].dropna().tolist()
             df_baza_bez_edytowanych = df_po_usunieciu[~df_po_usunieciu['id'].isin(ids_do_aktualizacji)]
             
-            # 3. Nadawanie ID dla NOWYCH wierszy (dodanych plusem)
             max_id = df_full['id'].max()
             if pd.isna(max_id): max_id = 0
             
@@ -358,10 +339,8 @@ if strona == "Tabela danych":
                     max_id += 1
                     df_to_update.at[idx, 'id'] = int(max_id)
             
-            # 4. SKLEJAMY: (Reszta bazy) + (To co wyszło z edytora)
             df_final = pd.concat([df_baza_bez_edytowanych, df_to_update], ignore_index=True)
             
-            # Sortowanie i wysyłka
             df_final = df_final.sort_values(by='data', ascending=False)
             
             zapisz_calosc(df_final)
@@ -372,53 +351,129 @@ if strona == "Tabela danych":
         except Exception as e:
             st.error(f"Błąd zapisu: {e}")
             # Pokaż szczegóły błędu do debugowania
-            import traceback
-            st.text(traceback.format_exc())
+        
 
 # ------------------------------------------------------------------
 # STRONA 2: STATYSTYKI
 # ------------------------------------------------------------------
-elif strona == "Statystyki":
-    st.title("📊 Analiza wydatków")
+
+elif strona == "Wydatki w czasie":
+    st.title("📊 Analiza wydatków w czasie")
+
+    
+    
+
+    col_f1, col_f2, col_f3 = st.columns([2, 2, 1])
+
+    with col_f1:
+        filtry_kat = st.multiselect("Kategorie", LISTA_KATEGORII)
+
+    with col_f2:
+        date_range = st.date_input("Zakres dat", key="wybrane_daty")
+
+
     
     if df_full.empty:
         st.info("Brak danych do wykresu.")
     else:
-        # Grupowanie
-        wydatki_kat = df_full.groupby("kategoria")["kwota"].sum().sort_values()
-        st.bar_chart(wydatki_kat)
+   
+        df_stats = df_full.copy()
+        df_stats= df_stats[~df_stats['kategoria'].isin(['Nieistotne','Bez kategorii','Regularne oszczędzanie'])]
+        if isinstance(date_range, tuple):
+            if len(date_range) == 2:
+                start_date, end_date = date_range
+                df_stats = df_stats[(df_stats['data'].dt.date >= start_date) & (df_stats['data'].dt.date <= end_date)]
+            elif len(date_range) == 1:
+                start_date = date_range[0]
+                df_stats = df_stats[df_stats['data'].dt.date == start_date]
 
+        if filtry_kat:
+            df_stats = df_stats[df_stats['kategoria'].isin(filtry_kat)]
+
+ 
+        df_stats['miesiac'] = df_stats['data'].dt.to_period('M').astype(str)
+        wydatki_kat = df_stats.groupby(['miesiac'])['kwota'].sum()
+        df_plot = wydatki_kat.reset_index().rename(columns={'kwota': 'kwota', 'miesiac': 'miesiac'})
+
+
+        chart = alt.Chart(df_plot).mark_bar().encode(
+            x=alt.X('miesiac:N', title='Miesiąc'),
+            y=alt.Y('kwota:Q', title='Suma (PLN)'),
+            tooltip=[alt.Tooltip('miesiac:N', title='Miesiąc'), alt.Tooltip('kwota:Q', title='Kwota', format='.2f')]
+        ).properties(
+            title='Wydatki wg miesiąca'
+        )
+
+        labels = alt.Chart(df_plot).mark_text(dy=5, color='white').encode(
+            x='miesiac:N',
+            y='kwota:Q',
+            text=alt.Text('kwota:Q', format='.2f')
+        )
+
+        # ustawienie stałego koloru słupków (np. granatowy)
+        chart = chart.mark_bar(color="#720094")
+        st.altair_chart(chart + labels, use_container_width=True)
 # ------------------------------------------------------------------
-# STRONA 3: DODAJ RĘCZNIE
+# STRONA 3
 # ------------------------------------------------------------------
-elif strona == "Dodaj ręcznie":
-    st.title("➕ Dodaj nowy wydatek")
+elif strona == "Wydatki według kategorii":
+    st.title("📊 Analiza wydatków według kategorii")
+
     
-    with st.form("nowy_wydatek"):
-        data_in = st.date_input("Data")
-        kat_in = st.selectbox("Kategoria", LISTA_KATEGORII)
-        opis_in = st.text_input("Opis", "Zakupy")
-        kwota_in = st.number_input("Kwota", step=0.01)
-        
-        submit = st.form_submit_button("Zapisz w chmurze")
-        
-        if submit:
-            # 1. Obliczamy ID
-            max_id = df_full['id'].max() if not df_full.empty else 0
-            if pd.isna(max_id): max_id = 0
-            new_id = int(max_id) + 1
-            
-            # 2. Tworzymy słownik z danymi
-            nowy_wiersz = {
-                'id': new_id,
-                'data': data_in, # datetime object
-                'kategoria': kat_in,
-                'opis': opis_in,
-                'kwota': kwota_in
-            }
-            
-            # 3. Wysyłamy do Sheets (append_row jest szybkie)
-            dodaj_wiersz(nowy_wiersz)
-            
-            st.success("Dodano wydatek!")
-            st.rerun()
+    
+
+    col_f1, col_f2, col_f3 = st.columns([2, 2, 1])
+
+    with col_f1:
+        filtry_kat = st.multiselect("Kategorie", LISTA_KATEGORII)
+
+    with col_f2:
+        date_range = st.date_input("Zakres dat", key="wybrane_daty")
+
+
+    
+    if df_full.empty:
+        st.info("Brak danych do wykresu.")
+    else:
+   
+        df_stats = df_full.copy()
+        df_stats= df_stats[~df_stats['kategoria'].isin(['Nieistotne','Nieistotne - inne','Bez kategorii','Regularne oszczędzanie','Wpływy','Wpływy - inne','Wynagrodzenie'])]
+        if isinstance(date_range, tuple):
+            if len(date_range) == 2:
+                start_date, end_date = date_range
+                df_stats = df_stats[(df_stats['data'].dt.date >= start_date) & (df_stats['data'].dt.date <= end_date)]
+            elif len(date_range) == 1:
+                start_date = date_range[0]
+                df_stats = df_stats[df_stats['data'].dt.date == start_date]
+
+        if filtry_kat:
+            df_stats = df_stats[df_stats['kategoria'].isin(filtry_kat)]
+
+ 
+        df_stats['miesiac'] = df_stats['data'].dt.to_period('M').astype(str)
+        wydatki_kat = -df_stats.groupby(['kategoria'])['kwota'].sum()
+
+        df_plot = wydatki_kat.reset_index().rename(columns={'kwota': 'kwota', 'kategoria': 'kategoria'})
+        # sortuj od największego do najmniejszego
+        df_plot = df_plot.sort_values('kwota', ascending=False)
+
+        chart = alt.Chart(df_plot).mark_bar(color="#720094").encode(
+            x=alt.X('kwota:Q', title='Suma (PLN)'),
+            y=alt.Y('kategoria:N',
+                sort=alt.EncodingSortField(field='kwota', order='descending'),
+                title='Kategoria',
+                axis=alt.Axis(labelLimit=400)  
+            ),
+            tooltip=[alt.Tooltip('kategoria:N', title='Kategoria'), alt.Tooltip('kwota:Q', title='Kwota', format='.2f')]
+        ).properties(
+            title='Wydatki wg kategorii',
+            width=800  # więcej szerokości wykresu, by etykiety się mieściły
+        )
+
+        labels = alt.Chart(df_plot).mark_text(dx=3, dy=0, color='white', size=13).encode(
+            x=alt.X('kwota:Q'),
+            y=alt.Y('kategoria:N', sort=alt.EncodingSortField(field='kwota', order='descending')),
+            text=alt.Text('kwota:Q', format='.2f')
+        )
+
+        st.altair_chart(chart + labels, use_container_width=True)
